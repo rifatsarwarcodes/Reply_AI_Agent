@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Entry point for the MirrorPay fraud-detection agent pipeline.
+"""Entry point for the MirrorPay heterogeneous multi-model fraud-detection pipeline.
+
+Architecture (Waterfall Routing):
+  Tier 1  PreFilter         — Gemini 2.5 Flash Lite      ($)
+  Tier 2  Transaction/Mob   — DeepSeek R1                 ($$)
+  Tier 3  Comms/Audio       — Claude 4.5 / Gemini 3.1 Pro ($$$)
+  Tier 4  Orchestrator      — GPT-5.2 Codex               ($$$$)
+  +       Memory Agent      — DeepSeek R1 (adaptive)
 
 Usage
 -----
-  # Run on a single dataset
   python main.py "Datasets/The Truman Show - train"
-
-  # Run on every dataset found in Datasets/
   python main.py --all
 """
 
@@ -24,7 +28,7 @@ from langfuse import Langfuse
 
 load_dotenv()
 
-import config  # noqa: E402  (needs env loaded first)
+import config  # noqa: E402
 from agents.orchestrator import Orchestrator  # noqa: E402
 
 logging.basicConfig(
@@ -34,10 +38,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-
-# ---------------------------------------------------------------------------
-# Langfuse session management
-# ---------------------------------------------------------------------------
 
 def _init_langfuse() -> Langfuse:
     return Langfuse(
@@ -52,10 +52,6 @@ def _session_id() -> str:
     return f"{team}-{ulid.new().str}"
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def _discover_datasets() -> list[Path]:
     found = sorted(config.DATASETS_DIR.glob("*- train"))
     if not found:
@@ -69,22 +65,22 @@ def _discover_datasets() -> list[Path]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MirrorPay fraud detection pipeline")
-    parser.add_argument(
-        "dataset",
-        nargs="?",
-        help="Path to dataset folder (relative to project root)",
-    )
-    parser.add_argument(
-        "--all", action="store_true",
-        help="Run on every dataset discovered in Datasets/",
-    )
+    parser = argparse.ArgumentParser(description="MirrorPay multi-model fraud detection")
+    parser.add_argument("dataset", nargs="?", help="Path to dataset folder")
+    parser.add_argument("--all", action="store_true", help="Run on every dataset")
     args = parser.parse_args()
 
     langfuse = _init_langfuse()
     session = _session_id()
     os.environ["LANGFUSE_SESSION_ID"] = session
     log.info("Session: %s", session)
+
+    log.info("━" * 60)
+    log.info("HETEROGENEOUS MULTI-MODEL PIPELINE")
+    log.info("━" * 60)
+    for role, cfg in config.MODELS.items():
+        log.info("  %-15s → %s", role, cfg["id"])
+    log.info("━" * 60)
 
     orchestrator = Orchestrator()
 

@@ -1,5 +1,9 @@
-"""Mobility Analyst — cross-references transaction locations with GPS pings
-to detect impossible-travel and far-from-home anomalies."""
+"""Mobility Analyst (Tier 2) — DeepSeek R1.
+
+Cross-references transaction locations with GPS pings to detect
+impossible-travel and far-from-home anomalies.  Uses DeepSeek R1 to
+verify spatial/temporal reasoning on flagged cases.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +20,7 @@ from models.schemas import (
     Dataset,
     LocationPing,
     RiskSignal,
+    Transaction,
     TransactionRisk,
     User,
 )
@@ -36,13 +41,20 @@ class MobilityAnalyst(BaseAgent):
     name = "mobility"
 
     @observe(name="mobility_analyst.analyze")
-    def analyze(self, dataset: Dataset, biotag_map: dict[str, User]) -> dict[str, TransactionRisk]:
+    def analyze(
+        self,
+        dataset: Dataset,
+        biotag_map: dict[str, User],
+        tx_subset: list[Transaction] | None = None,
+    ) -> dict[str, TransactionRisk]:
+        transactions = tx_subset if tx_subset is not None else dataset.transactions
         pings_by_user = self._index_pings(dataset.locations)
         city_coords = self._build_city_coords(dataset)
 
         risks: dict[str, TransactionRisk] = {}
+        travel_flags: list[tuple[Transaction, TransactionRisk, dict]] = []
 
-        for tx in dataset.transactions:
+        for tx in transactions:
             if not tx.location:
                 continue
 
@@ -56,16 +68,17 @@ class MobilityAnalyst(BaseAgent):
 
             tr = TransactionRisk(transaction_id=tx.transaction_id)
 
-            # -- Impossible / suspicious travel speed ---------------------
+            # -- Impossible / suspicious travel speed ----------------------
             window = timedelta(hours=config.LOCATION_TIME_WINDOW_H)
             nearby = [
                 p for p in pings_by_user.get(user.biotag, [])
                 if abs(p.timestamp - tx.timestamp) <= window
             ]
 
+            best_speed = 0.0
+            best_dist = 0.0
             if nearby:
                 best_speed = float("inf")
-                best_dist = 0.0
                 for p in nearby:
                     dist = haversine_km(p.lat, p.lng, tx_coords[0], tx_coords[1])
                     dt_h = abs((tx.timestamp - p.timestamp).total_seconds()) / 3600.0
@@ -87,11 +100,13 @@ class MobilityAnalyst(BaseAgent):
                         agent=self.name,
                     ))
 
-            # -- Far from home (no nearby ping needed) --------------------
+            # -- Far from home ---------------------------------------------
             home_dist = haversine_km(user.lat, user.lng, tx_coords[0], tx_coords[1])
             if home_dist >= config.FAR_FROM_HOME_KM:
-                already_flagged = any(s.agent == self.name and "travel" in s.reason.lower()
-                                      for s in tr.signals)
+                already_flagged = any(
+                    s.agent == self.name and "travel" in s.reason.lower()
+                    for s in tr.signals
+                )
                 if not already_flagged:
                     tr.signals.append(RiskSignal(
                         score=config.FAR_FROM_HOME_SCORE,
@@ -101,12 +116,76 @@ class MobilityAnalyst(BaseAgent):
 
             if tr.signals:
                 risks[tx.transaction_id] = tr
+                if tr.combined_score >= 0.50:
+                    travel_flags.append((tx, tr, {
+                        "speed": best_speed, "dist": best_dist,
+                        "home_dist": home_dist, "user": user,
+                        "tx_coords": tx_coords,
+                    }))
+
+        # ---- DeepSeek R1 spatial reasoning on top flags ------------------
+        if travel_flags:
+            self._llm_verify_travel(travel_flags, dataset)
 
         log.info("MobilityAnalyst flagged %d / %d transactions",
-                 len(risks), len(dataset.transactions))
+                 len(risks), len(transactions))
         return risks
 
     # ------------------------------------------------------------------
+    # DeepSeek R1 verification
+    # ------------------------------------------------------------------
+
+    @observe(name="mobility_analyst.llm_verify")
+    def _llm_verify_travel(
+        self,
+        flagged: list[tuple[Transaction, TransactionRisk, dict]],
+        dataset: Dataset,
+    ) -> None:
+        batch = flagged[:20]
+        summaries = []
+        for i, (tx, tr, meta) in enumerate(batch):
+            user = meta["user"]
+            summaries.append(
+                f"[{i}] id={tx.transaction_id} "
+                f"user={user.first_name} {user.last_name} home={user.city} "
+                f"({user.lat:.2f},{user.lng:.2f}) "
+                f"tx_location={tx.location} tx_coords=({meta['tx_coords'][0]:.2f},{meta['tx_coords'][1]:.2f}) "
+                f"speed={meta['speed']:.0f}km/h dist={meta['dist']:.0f}km "
+                f"home_dist={meta['home_dist']:.0f}km "
+                f"time={tx.timestamp:%Y-%m-%d %H:%M} score={tr.combined_score:.2f}"
+            )
+
+        system = (
+            "You are a geospatial fraud analyst. Verify these impossible-travel "
+            "detections. Consider: commercial flights (~900km/h), high-speed rail "
+            "(~300km/h), border cities that are close. Is the travel truly impossible? "
+            "Reply with JSON: [{\"idx\": <int>, \"confirmed\": <bool>, "
+            "\"adjusted_score\": <float 0-1>}]"
+        )
+        user_prompt = f"Travel anomalies to verify:\n" + "\n".join(summaries)
+
+        try:
+            result = self._call_llm_json(system, user_prompt)
+            if isinstance(result, list):
+                for item in result:
+                    idx = int(item.get("idx", -1))
+                    adj = float(item.get("adjusted_score", -1))
+                    if 0 <= idx < len(batch) and 0 <= adj <= 1:
+                        tx, tr, _ = batch[idx]
+                        confirmed = item.get("confirmed", True)
+                        if not confirmed or abs(adj - tr.combined_score) > 0.1:
+                            tr.signals.append(RiskSignal(
+                                score=adj,
+                                reason=f"DeepSeek R1 geo-verification: confirmed={confirmed}",
+                                agent=self.name,
+                            ))
+        except Exception as exc:
+            log.warning("MobilityAnalyst LLM verify failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _index_pings(locations: list[LocationPing]) -> dict[str, list[LocationPing]]:
         idx: dict[str, list[LocationPing]] = defaultdict(list)
@@ -118,7 +197,6 @@ class MobilityAnalyst(BaseAgent):
 
     @staticmethod
     def _build_city_coords(dataset: Dataset) -> dict[str, tuple[float, float]]:
-        """Map city name → (lat, lng) from user residences + location pings."""
         coords: dict[str, tuple[float, float]] = {}
         for u in dataset.users:
             if u.city:
@@ -133,7 +211,6 @@ class MobilityAnalyst(BaseAgent):
         location_str: str,
         city_coords: dict[str, tuple[float, float]],
     ) -> tuple[float, float] | None:
-        """Try to map a transaction location string to coordinates."""
         loc = location_str.lower().strip()
         if not loc or "online" in loc:
             return None

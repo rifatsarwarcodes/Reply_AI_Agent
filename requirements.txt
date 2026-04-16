@@ -3,3 +3,4 @@ langchain-openai>=0.3,<1
 langfuse>=3,<4
 python-dotenv
 ulid-py
+requests
