@@ -83,8 +83,19 @@ class TransactionRisk:
         if not self.signals:
             return 0.0
         top = self.max_score
-        n_flagging = sum(1 for s in self.signals if s.score > 0.25)
-        boosted = top * (1.0 + 0.1 * max(n_flagging - 1, 0))
+        unique_agents = len({s.agent for s in self.signals if s.score > 0.15})
+        n_signals = sum(1 for s in self.signals if s.score > 0.15)
+
+        # Multi-agent corroboration: independent agents agreeing is strong
+        if unique_agents >= 3:
+            boosted = top * 1.30
+        elif unique_agents >= 2:
+            boosted = top * 1.20
+        elif n_signals >= 2:
+            boosted = top * 1.10
+        else:
+            boosted = top
+
         return min(boosted, 1.0)
 
 

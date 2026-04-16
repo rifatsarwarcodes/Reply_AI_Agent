@@ -182,6 +182,9 @@ class AudioAnalyst(BaseAgent):
             for tx in transactions:
                 if tx.sender_id != user.biotag:
                     continue
+                # Skip incoming salary
+                if tx.sender_id.startswith("EMP") or "salary" in (tx.description or "").lower():
+                    continue
                 if ts <= tx.timestamp <= ts + window:
                     days_after = (tx.timestamp - ts).days + 1
                     decay = max(0.3, 1.0 - (days_after / config.POST_PHISHING_WINDOW_DAYS))

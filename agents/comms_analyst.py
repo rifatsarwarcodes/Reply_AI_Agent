@@ -1,16 +1,21 @@
-"""Comms Analyst (Tier 3) — Claude 4.5 Sonnet.
+"""Comms Analyst (Tier 3) — Gemini 2.5 Pro.
 
-Deep content analysis of SMS and email for phishing / social engineering.
-Claude's 1M-token context lets us feed entire conversation histories
-and detect evolving social engineering tactics with high nuance.
+Scans SMS and email for phishing, propagates risk to transactions.
+
+Strategy: Flag all non-salary transactions from phished users within
+the window, but BOOST score when corroborating signals exist (new
+recipient, unusual amount).  This catches more fraud while the
+scoring system and final LLM review filter false positives.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from collections import defaultdict
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
+from statistics import median
 
 from langfuse import observe
 
@@ -53,6 +58,13 @@ _EMAIL_DATE_RX = re.compile(
 )
 
 
+def _is_salary(tx: Transaction) -> bool:
+    if tx.sender_id.startswith("EMP"):
+        return True
+    desc = (tx.description or "").lower()
+    return "salary" in desc
+
+
 class CommsAnalyst(BaseAgent):
     name = "comms"
 
@@ -71,9 +83,11 @@ class CommsAnalyst(BaseAgent):
         for ev in phishing_events:
             user_events.setdefault(ev.user_biotag, []).append(ev)
 
-        # Claude 4.5 Sonnet deep analysis on detected phishing
         if phishing_events:
-            self._claude_deep_analysis(dataset, phishing_events, biotag_map)
+            self._llm_refine(dataset, phishing_events, biotag_map)
+
+        user_recipients = self._build_user_recipient_history(dataset)
+        user_medians = self._build_user_amount_medians(dataset, biotag_map)
 
         risks: dict[str, TransactionRisk] = {}
         window = timedelta(days=config.POST_PHISHING_WINDOW_DAYS)
@@ -83,21 +97,48 @@ class CommsAnalyst(BaseAgent):
             if not user or not user.biotag:
                 continue
 
-            if tx.transaction_type == "transfer" and tx.description and "salary" in tx.description.lower():
+            # Only exclude salary — everything else is fair game
+            if _is_salary(tx):
                 continue
 
             events = user_events.get(user.biotag, [])
             if not events:
                 continue
 
+            # Detect corroborating signals for score boosting
+            is_new_recipient = tx.recipient_id not in user_recipients.get(user.biotag, set())
+            is_high_amount = self._is_unusually_high(tx, user, user_medians)
+            is_night = tx.timestamp.hour in config.NIGHT_HOURS
+
             for ev in events:
                 if ev.timestamp <= tx.timestamp <= ev.timestamp + window:
                     suscept = user.phishing_susceptibility
                     days_after = (tx.timestamp - ev.timestamp).days + 1
                     decay = max(0.3, 1.0 - (days_after / config.POST_PHISHING_WINDOW_DAYS))
-                    score = ev.severity * (0.5 + 0.5 * suscept) * decay
+
+                    base = ev.severity * (0.5 + 0.5 * suscept) * decay
+
+                    # Boost for corroborating signals
+                    boost = 1.0
+                    corr = []
+                    if is_new_recipient:
+                        boost += 0.25
+                        corr.append("new_recipient")
+                    if is_high_amount:
+                        boost += 0.20
+                        corr.append("unusual_amount")
+                    if is_night:
+                        boost += 0.10
+                        corr.append("night_time")
+
+                    # Dampen for clearly routine (rent, subscription)
+                    desc_lower = (tx.description or "").lower()
+                    if any(kw in desc_lower for kw in ("rent payment", "subscription", "insurance")):
+                        boost *= 0.6
+
+                    score = base * boost
                     score = min(score, 0.85)
-                    if score < 0.25:
+                    if score < 0.20:
                         continue
 
                     tr = risks.setdefault(
@@ -107,9 +148,10 @@ class CommsAnalyst(BaseAgent):
                     tr.signals.append(RiskSignal(
                         score=score,
                         reason=(
-                            f"Post-phishing ({ev.source}, {days_after}d after): "
-                            f"{ev.message_snippet[:60]}… | "
-                            f"susceptibility={suscept:.0%}"
+                            f"Post-phishing ({ev.source}, {days_after}d): "
+                            f"{ev.message_snippet[:50]}… | "
+                            f"corr=[{','.join(corr) or 'none'}] "
+                            f"suscept={suscept:.0%}"
                         ),
                         agent=self.name,
                     ))
@@ -120,7 +162,44 @@ class CommsAnalyst(BaseAgent):
         return risks
 
     # ------------------------------------------------------------------
-    # Heuristic phishing detection (fast first pass)
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_user_recipient_history(dataset: Dataset) -> dict[str, set[str]]:
+        history: dict[str, set[str]] = defaultdict(set)
+        for tx in dataset.transactions:
+            if tx.sender_id and tx.recipient_id:
+                history[tx.sender_id].add(tx.recipient_id)
+        return dict(history)
+
+    @staticmethod
+    def _build_user_amount_medians(
+        dataset: Dataset, biotag_map: dict[str, User]
+    ) -> dict[tuple[str, str], float]:
+        buckets: dict[tuple[str, str], list[float]] = defaultdict(list)
+        for tx in dataset.transactions:
+            user = biotag_map.get(tx.sender_id)
+            if user and user.biotag:
+                buckets[(user.biotag, tx.transaction_type)].append(tx.amount)
+        return {k: median(v) for k, v in buckets.items() if v}
+
+    @staticmethod
+    def _is_unusually_high(
+        tx: Transaction,
+        user: User,
+        medians: dict[tuple[str, str], float],
+    ) -> bool:
+        if not user.biotag:
+            return False
+        key = (user.biotag, tx.transaction_type)
+        med = medians.get(key)
+        if med and med > 0:
+            return tx.amount > med * 2.0
+        return tx.amount > 2000
+
+    # ------------------------------------------------------------------
+    # Phishing detection
     # ------------------------------------------------------------------
 
     def _detect_all_phishing(self, dataset: Dataset) -> list[PhishingEvent]:
@@ -136,17 +215,13 @@ class CommsAnalyst(BaseAgent):
             score = self._heuristic_phishing_score(text)
             if score < 0.3:
                 continue
-
             ts = self._extract_sms_timestamp(text)
             target_biotag = self._sms_to_biotag(text, dataset.users)
             if not target_biotag:
                 continue
-
             events.append(PhishingEvent(
-                user_biotag=target_biotag,
-                timestamp=ts,
-                source="sms",
-                severity=score,
+                user_biotag=target_biotag, timestamp=ts,
+                source="sms", severity=score,
                 message_snippet=text[:200],
             ))
         return events
@@ -159,24 +234,16 @@ class CommsAnalyst(BaseAgent):
             score = self._heuristic_phishing_score(raw)
             if score < 0.3:
                 continue
-
             ts = self._extract_mail_timestamp(raw)
             target_biotag = self._mail_to_biotag(raw, dataset.users)
             if not target_biotag:
                 continue
-
             events.append(PhishingEvent(
-                user_biotag=target_biotag,
-                timestamp=ts,
-                source="email",
-                severity=score,
+                user_biotag=target_biotag, timestamp=ts,
+                source="email", severity=score,
                 message_snippet=plain[:200],
             ))
         return events
-
-    # ------------------------------------------------------------------
-    # Heuristic scoring
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _heuristic_phishing_score(text: str) -> float:
@@ -191,10 +258,11 @@ class CommsAnalyst(BaseAgent):
                     score = max(score, config.PHISHING_CONFIRMED_SCORE)
                     break
 
-        for kw in config.URGENCY_KEYWORDS:
-            if kw.lower() in text_lower:
-                score = max(score, config.PHISHING_SUSPECTED_SCORE)
-                break
+        urgency_count = sum(1 for kw in config.URGENCY_KEYWORDS if kw.lower() in text_lower)
+        if urgency_count >= 2:
+            score = max(score, config.PHISHING_SUSPECTED_SCORE)
+        elif urgency_count == 1 and score >= 0.5:
+            score = max(score, config.PHISHING_SUSPECTED_SCORE)
 
         from_phish = re.search(r"From:.*?(paypa1|amaz0n|netfl1x|ub3r|ch4se)", text, re.I)
         if from_phish:
@@ -203,18 +271,16 @@ class CommsAnalyst(BaseAgent):
         return score
 
     # ------------------------------------------------------------------
-    # Claude 4.5 Sonnet deep analysis
+    # LLM refinement
     # ------------------------------------------------------------------
 
-    @observe(name="comms_analyst.claude_deep_analysis")
-    def _claude_deep_analysis(
+    @observe(name="comms_analyst.llm_refine")
+    def _llm_refine(
         self,
         dataset: Dataset,
         events: list[PhishingEvent],
         biotag_map: dict[str, User],
     ) -> None:
-        """Leverage Claude 4.5 Sonnet's 1M context window to analyze
-        full conversation threads for social engineering patterns."""
         user_groups: dict[str, list[PhishingEvent]] = {}
         for ev in events:
             user_groups.setdefault(ev.user_biotag, []).append(ev)
@@ -224,52 +290,21 @@ class CommsAnalyst(BaseAgent):
             if not user:
                 continue
 
-            # Build comprehensive context for Claude
-            all_sms_for_user = []
-            for entry in dataset.sms_messages:
-                text = entry.get("sms", "")
-                if user.first_name.lower() in text.lower():
-                    all_sms_for_user.append(text[:500])
-
-            all_mails_for_user = []
-            for entry in dataset.mail_messages:
-                raw = entry.get("mail", "")
-                if user.first_name.lower() in raw.lower():
-                    plain = strip_html(raw) if "<html" in raw.lower() else raw
-                    all_mails_for_user.append(plain[:500])
-
             snippets = "\n---\n".join(
                 f"[{i+1}] ({ev.source}, {ev.timestamp:%Y-%m-%d}) {ev.message_snippet[:200]}"
                 for i, ev in enumerate(evts[:20])
             )
 
-            context_msgs = ""
-            if all_sms_for_user:
-                context_msgs += "\n\nAll SMS involving this user:\n" + "\n---\n".join(all_sms_for_user[:15])
-            if all_mails_for_user:
-                context_msgs += "\n\nAll emails involving this user:\n" + "\n---\n".join(all_mails_for_user[:15])
-
             system = (
-                "You are a senior cybersecurity analyst specializing in social "
-                "engineering detection. Analyze the FULL conversation history "
-                "for this user. Look for:\n"
-                "1. Typosquat domains (e.g. paypa1.com, amaz0n.net)\n"
-                "2. Multi-stage social engineering (trust building -> urgency -> action)\n"
-                "3. Urgency patterns (account suspension threats, time limits)\n"
-                "4. Credential harvesting attempts\n"
-                "5. Impersonation of legitimate entities\n"
-                "6. Subtle manipulation over multiple messages\n\n"
-                "For each flagged message, classify severity (0-1 where 1 = "
-                "certain phishing). Return JSON: a list of objects with keys "
-                "'index' (1-based) and 'severity' (float 0-1)."
+                "You are a cybersecurity analyst. Classify each message: "
+                "is it PHISHING or LEGITIMATE? Be strict: legit services "
+                "also use urgency language. Only mark phishing if there are "
+                "typosquat domains, fake senders, or clear social engineering. "
+                "Return JSON: [{\"index\": <1-based>, \"severity\": <float 0-1>}]"
             )
             user_prompt = (
-                f"User: {user.first_name} {user.last_name}, "
-                f"{user.job} in {user.city}.\n"
-                f"Phishing susceptibility: {user.phishing_susceptibility:.0%}.\n\n"
-                f"Flagged messages:\n{snippets}"
-                f"{context_msgs}\n\n"
-                "Respond ONLY with the JSON array."
+                f"User: {user.first_name} {user.last_name}, {user.job} in {user.city}.\n\n"
+                f"Messages:\n{snippets}\n\nRespond ONLY with the JSON array."
             )
 
             try:
@@ -281,10 +316,10 @@ class CommsAnalyst(BaseAgent):
                         if 0 <= idx < len(evts):
                             evts[idx].severity = sev
             except Exception as exc:
-                log.warning("Claude deep analysis failed for %s: %s", biotag, exc)
+                log.warning("LLM refinement failed for %s: %s", biotag, exc)
 
     # ------------------------------------------------------------------
-    # Entity resolution helpers
+    # Entity resolution
     # ------------------------------------------------------------------
 
     def _sms_to_biotag(self, text: str, users: list[User]) -> str | None:

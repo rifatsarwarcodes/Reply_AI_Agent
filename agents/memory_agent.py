@@ -113,11 +113,13 @@ class MemoryAgent(BaseAgent):
 
         flag_ratio = len(flagged) / max(len(all_txs), 1)
 
-        # Heuristic threshold adjustment
-        if flag_ratio > 0.35:
-            recommended = config.FRAUD_THRESHOLD + 0.05
-        elif flag_ratio < 0.10:
-            recommended = config.FRAUD_THRESHOLD - 0.05
+        # Heuristic: keep flagging ratio between 10-20%
+        if flag_ratio > 0.25:
+            recommended = config.FRAUD_THRESHOLD + 0.08
+        elif flag_ratio > 0.20:
+            recommended = config.FRAUD_THRESHOLD + 0.04
+        elif flag_ratio < 0.05:
+            recommended = config.FRAUD_THRESHOLD - 0.04
         else:
             recommended = config.FRAUD_THRESHOLD
 
@@ -152,9 +154,11 @@ class MemoryAgent(BaseAgent):
             "You are a fraud detection tuning agent. Given the current detection "
             "statistics, recommend an optimal fraud threshold (float between "
             f"{config.FRAUD_THRESHOLD_MIN} and {config.FRAUD_THRESHOLD_MAX}). "
-            "Remember: false negatives (missing fraud) cost ~10x more than false "
-            "positives (blocking legit). The competition requires catching at least "
-            "15% of actual fraud to avoid disqualification. "
+            "CRITICAL: The system is scored on BOTH fraud detection AND economic "
+            "sustainability. Too many false positives hurt the score just like "
+            "missed fraud. Aim for precision: flag 10-20% of transactions max. "
+            "If the current flagging ratio is already high (>20%), RAISE the "
+            "threshold. Only lower it if very few transactions are flagged (<5%). "
             "Reply with ONLY a JSON object: {\"threshold\": <float>, \"reasoning\": \"...\"}"
         )
         user_prompt = (

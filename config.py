@@ -3,8 +3,8 @@
 Model Tiers (waterfall routing):
   Tier 1  Pre-Filter        — Gemini 2.5 Flash Lite  ($)
   Tier 2  Logic Verification — DeepSeek R1            ($$)
-  Tier 3  Deep Analysis      — Claude 4.5 / Gemini 3.1 Pro ($$$)
-  Tier 4  Final Decisions    — GPT-5.2 Codex          ($$$$)
+  Tier 3  Deep Analysis      — Gemini 2.5 Pro / Gemini 3.1 Pro ($$$)
+  Tier 4  Final Decisions    — Gemini 2.5 Pro          ($$$$)
 """
 
 import os
@@ -15,13 +15,11 @@ DATASETS_DIR = BASE_DIR / "Datasets"
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# OpenRouter base URL (shared by all models)
-# ---------------------------------------------------------------------------
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 # ---------------------------------------------------------------------------
-# Per-role model assignments
+# Per-role model assignments — only using models that reliably work
+# (Claude/GPT hit 404 privacy errors on this OpenRouter account)
 # ---------------------------------------------------------------------------
 MODELS = {
     "prefilter": {
@@ -45,7 +43,7 @@ MODELS = {
         "max_tokens": 4096,
     },
     "comms": {
-        "id": "anthropic/claude-sonnet-4.5",
+        "id": "google/gemini-2.5-pro",
         "temperature": 0.15,
         "max_tokens": 4096,
     },
@@ -55,17 +53,16 @@ MODELS = {
         "max_tokens": 4096,
     },
     "orchestrator": {
-        "id": "openai/gpt-5.2-codex",
+        "id": "google/gemini-2.5-pro",
         "temperature": 0.2,
         "max_tokens": 4096,
     },
 }
 
-# Fallback model if a role isn't mapped above
 DEFAULT_MODEL = "google/gemini-2.5-flash-lite"
 
 # ---------------------------------------------------------------------------
-# Agent scoring weights (used in orchestrator fusion)
+# Agent scoring weights
 # ---------------------------------------------------------------------------
 AGENT_WEIGHTS = {
     "transaction": 0.35,
@@ -75,20 +72,19 @@ AGENT_WEIGHTS = {
 }
 
 # ---------------------------------------------------------------------------
-# Thresholds
+# Thresholds — balanced to catch 15-25% of transactions
 # ---------------------------------------------------------------------------
-FRAUD_THRESHOLD = 0.35
-MAX_FLAG_RATIO = 0.50
+FRAUD_THRESHOLD = 0.38
+MAX_FLAG_RATIO = 0.40
 
-# Adaptive range the memory agent can shift the fraud threshold within
-FRAUD_THRESHOLD_MIN = 0.25
-FRAUD_THRESHOLD_MAX = 0.55
+FRAUD_THRESHOLD_MIN = 0.32
+FRAUD_THRESHOLD_MAX = 0.50
 
 # ---------------------------------------------------------------------------
-# Pre-filter settings
+# Hard exclusion: ONLY salary payments are truly immune
 # ---------------------------------------------------------------------------
-PREFILTER_BATCH_SIZE = 50
-PREFILTER_SAFE_THRESHOLD = 0.15
+LEGIT_SENDER_PREFIXES = ("EMP",)
+LEGIT_DESCRIPTION_KEYWORDS = ("salary payment", "salary")
 
 # ---------------------------------------------------------------------------
 # Transaction analyst
@@ -99,8 +95,8 @@ AMOUNT_ZSCORE_MED = 2.0
 AMOUNT_HIGH_SCORE = 0.50
 AMOUNT_MED_SCORE = 0.30
 NIGHT_HOURS = range(0, 6)
-NIGHT_SCORE = 0.15
-NEW_RECIPIENT_SCORE = 0.10
+NIGHT_SCORE = 0.20
+NEW_RECIPIENT_SCORE = 0.15
 
 # ---------------------------------------------------------------------------
 # Mobility analyst
@@ -132,5 +128,10 @@ URGENCY_KEYWORDS = [
 ]
 PHISHING_CONFIRMED_SCORE = 0.80
 PHISHING_SUSPECTED_SCORE = 0.50
-POST_PHISHING_WINDOW_DAYS = 14
+
+POST_PHISHING_WINDOW_DAYS = 10
+
+# Corroboration: only exclude salary, propagate to all other tx from phished user
+PHISHING_REQUIRE_CORROBORATION = False
+
 DEFAULT_SUSCEPTIBILITY = 0.35
