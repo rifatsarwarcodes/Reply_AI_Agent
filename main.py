@@ -1,65 +1,123 @@
+#!/usr/bin/env python3
+"""Entry point for the MirrorPay fraud-detection agent pipeline.
+
+Usage
+-----
+  # Run on a single dataset
+  python main.py "Datasets/The Truman Show - train"
+
+  # Run on every dataset found in Datasets/
+  python main.py --all
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
 import os
-from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
+import sys
+from pathlib import Path
+
 import ulid
-from langfuse import Langfuse, observe
-from langfuse.langchain import CallbackHandler
+from dotenv import load_dotenv
+from langfuse import Langfuse
 
 load_dotenv()
 
-model = ChatOpenAI(
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-    base_url="https://openrouter.ai/api/v1",
-    model="gpt-4o-mini",
-    temperature=0.7,
-    max_tokens=50,
+import config  # noqa: E402  (needs env loaded first)
+from agents.orchestrator import Orchestrator  # noqa: E402
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%H:%M:%S",
 )
-
-langfuse_client = Langfuse(
-    public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
-    secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
-    host=os.getenv("LANGFUSE_HOST", "https://challenges.reply.com/langfuse")
-)
+log = logging.getLogger("main")
 
 
-def generate_session_id():
-    team = os.getenv("TEAM_NAME", "tutorial").replace(" ", "-")
+# ---------------------------------------------------------------------------
+# Langfuse session management
+# ---------------------------------------------------------------------------
+
+def _init_langfuse() -> Langfuse:
+    return Langfuse(
+        public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+        secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+        host=os.getenv("LANGFUSE_HOST", "https://challenges.reply.com/langfuse"),
+    )
+
+
+def _session_id() -> str:
+    team = os.getenv("TEAM_NAME", "default-team").replace(" ", "-")
     return f"{team}-{ulid.new().str}"
 
 
-def invoke_langchain(model, prompt, langfuse_handler, session_id):
-    messages = [HumanMessage(content=prompt)]
-    response = model.invoke(messages, config={
-        "callbacks": [langfuse_handler],
-        "metadata": {"langfuse_session_id": session_id},
-    })
-    return response.content
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _discover_datasets() -> list[Path]:
+    found = sorted(config.DATASETS_DIR.glob("*- train"))
+    if not found:
+        found = sorted(config.DATASETS_DIR.glob("*- eval"))
+    if not found:
+        found = sorted(
+            p for p in config.DATASETS_DIR.iterdir()
+            if p.is_dir() and not p.name.startswith(".")
+        )
+    return found
 
 
-@observe()
-def run_llm_call(session_id, model, prompt):
-    langfuse_handler = CallbackHandler()
-    return invoke_langchain(model, prompt, langfuse_handler, session_id)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="MirrorPay fraud detection pipeline")
+    parser.add_argument(
+        "dataset",
+        nargs="?",
+        help="Path to dataset folder (relative to project root)",
+    )
+    parser.add_argument(
+        "--all", action="store_true",
+        help="Run on every dataset discovered in Datasets/",
+    )
+    args = parser.parse_args()
 
+    langfuse = _init_langfuse()
+    session = _session_id()
+    os.environ["LANGFUSE_SESSION_ID"] = session
+    log.info("Session: %s", session)
 
-def main():
-    questions = [
-        "What is machine learning?",
-        "Explain neural networks briefly.",
-        "What is the difference between AI and ML?"
-    ]
+    orchestrator = Orchestrator()
 
-    session_id = generate_session_id()
+    if args.all:
+        datasets = _discover_datasets()
+        if not datasets:
+            log.error("No datasets found under %s", config.DATASETS_DIR)
+            sys.exit(1)
+        log.info("Discovered %d dataset(s)", len(datasets))
+    elif args.dataset:
+        p = config.BASE_DIR / args.dataset
+        if not p.exists():
+            p = Path(args.dataset)
+        datasets = [p]
+    else:
+        datasets = _discover_datasets()
+        if not datasets:
+            parser.print_help()
+            sys.exit(1)
 
-    for i, question in enumerate(questions, 1):
-        response = run_llm_call(session_id, model, question)
-        print(f"[{i}/{len(questions)}] {question} -> {response[:60]}...")
+    total_flagged = 0
+    for ds_path in datasets:
+        log.info("━" * 60)
+        log.info("Processing: %s", ds_path.name)
+        log.info("━" * 60)
+        flagged = orchestrator.run(str(ds_path))
+        total_flagged += len(flagged)
+        log.info("  → %d transactions flagged as fraudulent\n", len(flagged))
 
-    langfuse_client.flush()
-
-    print(f"\n{len(questions)} traces sent | session: {session_id}")
-    print("Check the Langfuse dashboard to verify (may take a few minutes to update).")
+    langfuse.flush()
+    log.info("Done. Total flagged across all datasets: %d", total_flagged)
+    log.info("Session ID: %s", session)
+    log.info("Output files in: %s", config.OUTPUT_DIR)
 
 
 if __name__ == "__main__":
